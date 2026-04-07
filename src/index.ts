@@ -1828,12 +1828,26 @@ if (PORT) {
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
     if (req.method === "OPTIONS") {
       res.writeHead(204);
       res.end();
       return;
+    }
+
+    // Bearer token authentication (skipped for /health)
+    if (req.url !== "/health") {
+      const accessToken = process.env.MCP_ACCESS_TOKEN;
+      if (accessToken) {
+        const authHeader = req.headers["authorization"] ?? "";
+        const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+        if (token !== accessToken) {
+          res.writeHead(401, { "Content-Type": "text/plain" });
+          res.end("Unauthorized");
+          return;
+        }
+      }
     }
 
     if (req.method === "GET" && req.url === "/sse") {
