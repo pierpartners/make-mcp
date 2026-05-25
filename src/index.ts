@@ -1,6 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -1823,9 +1823,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : undefined;
 
 if (PORT) {
-  // HTTP/SSE mode — usado no Railway / LibreChat remoto
-  let sseTransport: SSEServerTransport | null = null;
-
+  // HTTP/Streamable mode — usado no Railway / Claude.ai web
   // ── Microsoft OAuth (Entra ID) ────────────────────────────────────────────
   const AZURE_CLIENT_ID = process.env.AZURE_CLIENT_ID ?? "";
   const AZURE_CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET ?? "";
@@ -1859,6 +1857,10 @@ if (PORT) {
   // Códigos OAuth temporários emitidos para o Claude.ai (expiram em 5 min)
   const pendingCodes = new Map<string, { clientRedirectUri: string; clientState: string | null; email: string; name: string; expiresAt: number }>();
   setInterval(() => { const now = Date.now(); for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k); }, 5 * 60 * 1000);
+
+  // Streamable HTTP transport (protocolo moderno, usado pelo Claude.ai web)
+  const mcpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  await server.connect(mcpTransport);
 
   const PAGE_LANDING = `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -2135,24 +2137,16 @@ function copy(){
     const authHeader = req.headers["authorization"] ?? "";
     const sessionToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
     if (!verifySession(sessionToken)) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized", loginUrl: `${SERVER_BASE_URL}/` }));
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": `Bearer realm="${SERVER_BASE_URL}"`,
+      });
+      res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
 
-    if (req.method === "GET" && path === "/sse") {
-      if (sseTransport) {
-        try { await server.close(); } catch { /* ignore */ }
-      }
-      sseTransport = new SSEServerTransport("/message", res);
-      await server.connect(sseTransport);
-    } else if (req.method === "POST" && path.startsWith("/message")) {
-      if (sseTransport) {
-        await sseTransport.handlePostMessage(req, res);
-      } else {
-        res.writeHead(503, { "Content-Type": "text/plain" });
-        res.end("No active SSE session");
-      }
+    if (path === "/mcp") {
+      await mcpTransport.handleRequest(req, res);
     } else {
       res.writeHead(404);
       res.end();
