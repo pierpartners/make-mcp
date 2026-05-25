@@ -1856,6 +1856,10 @@ if (PORT) {
     } catch { return null; }
   }
 
+  // Códigos OAuth temporários emitidos para o Claude.ai (expiram em 5 min)
+  const pendingCodes = new Map<string, { clientRedirectUri: string; clientState: string | null; email: string; name: string; expiresAt: number }>();
+  setInterval(() => { const now = Date.now(); for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k); }, 5 * 60 * 1000);
+
   const PAGE_LANDING = `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -1974,6 +1978,71 @@ function copy(){
       return;
     }
 
+    // Descoberta OAuth 2.0 (RFC 8414) — usado pelo Claude.ai para encontrar os endpoints
+    if (path === "/.well-known/oauth-authorization-server") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        issuer: SERVER_BASE_URL,
+        authorization_endpoint: `${SERVER_BASE_URL}/oauth/authorize`,
+        token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code"],
+        token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+        scopes_supported: ["openid", "profile", "email"],
+      }));
+      return;
+    }
+
+    // Endpoint de autorização OAuth — Claude.ai redireciona o usuário aqui
+    if (path === "/oauth/authorize") {
+      const clientRedirectUri = reqUrl.searchParams.get("redirect_uri");
+      const clientState = reqUrl.searchParams.get("state");
+      if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID) {
+        res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(pageError("Servidor não configurado. Defina AZURE_CLIENT_ID e AZURE_TENANT_ID."));
+        return;
+      }
+      // Codifica redirect_uri e state do Claude.ai no state que mandamos para a Microsoft
+      const msState = Buffer.from(JSON.stringify({ clientRedirectUri, clientState })).toString("base64url");
+      const params = new URLSearchParams({
+        client_id: AZURE_CLIENT_ID,
+        response_type: "code",
+        redirect_uri: `${SERVER_BASE_URL}/auth/callback`,
+        scope: "openid profile email User.Read",
+        response_mode: "query",
+        state: msState,
+      });
+      res.writeHead(302, { Location: `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/authorize?${params}` });
+      res.end();
+      return;
+    }
+
+    // Endpoint de token OAuth — Claude.ai troca o código pelo access token
+    if (path === "/oauth/token" && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const formParams = new URLSearchParams(body);
+      const grantType = formParams.get("grant_type");
+      const authCode = formParams.get("code");
+      if (grantType !== "authorization_code" || !authCode) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_request" }));
+        return;
+      }
+      const pending = pendingCodes.get(authCode);
+      if (!pending || pending.expiresAt < Date.now()) {
+        pendingCodes.delete(authCode);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_grant" }));
+        return;
+      }
+      pendingCodes.delete(authCode);
+      const accessToken = signSession(pending.email, pending.name);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ access_token: accessToken, token_type: "Bearer", expires_in: 90 * 86400 }));
+      return;
+    }
+
     if (path === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(PAGE_LANDING);
@@ -2001,6 +2070,7 @@ function copy(){
     if (path === "/auth/callback") {
       const code = reqUrl.searchParams.get("code");
       const oauthError = reqUrl.searchParams.get("error");
+      const msState = reqUrl.searchParams.get("state");
       if (oauthError || !code) {
         res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
         res.end(pageError(`Autenticação recusada pela Microsoft: ${oauthError ?? "código ausente"}`));
@@ -2026,6 +2096,30 @@ function copy(){
         });
         const email: string = meResp.data.mail ?? meResp.data.userPrincipalName ?? "";
         const name: string = meResp.data.displayName ?? email;
+
+        // Detecta se é fluxo OAuth do Claude.ai (tem state com clientRedirectUri)
+        if (msState) {
+          try {
+            const stateData = JSON.parse(Buffer.from(msState, "base64url").toString()) as { clientRedirectUri?: string; clientState?: string };
+            if (stateData.clientRedirectUri) {
+              const authCode = crypto.randomBytes(32).toString("hex");
+              pendingCodes.set(authCode, {
+                clientRedirectUri: stateData.clientRedirectUri,
+                clientState: stateData.clientState ?? null,
+                email, name,
+                expiresAt: Date.now() + 5 * 60 * 1000,
+              });
+              const redirectBack = new URL(stateData.clientRedirectUri);
+              redirectBack.searchParams.set("code", authCode);
+              if (stateData.clientState) redirectBack.searchParams.set("state", stateData.clientState);
+              res.writeHead(302, { Location: redirectBack.toString() });
+              res.end();
+              return;
+            }
+          } catch { /* state não é do Claude.ai, cai no fluxo direto */ }
+        }
+
+        // Fluxo direto (landing page) — exibe token ao usuário
         const sessionToken = signSession(email, name);
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(pageSuccess(name, sessionToken));
