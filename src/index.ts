@@ -1237,14 +1237,15 @@ async function findRedundantScenarios(team_id?: string, region?: string) {
 }
 
 // ── MCP Server ─────────────────────────────────────────────────────────────────
-const server = new Server(
-  { name: "make-mcp", version: "2.0.0" },
-  { capabilities: { tools: {} } }
-);
+function buildMcpServer(): Server {
+  const srv = new Server(
+    { name: "make-mcp", version: "2.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
 const REGION_PROP = { type: "string", description: "Região Make.com: 'us1', 'us2', 'eu1', etc. (usa MAKE_REGION do env se omitido)" };
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  srv.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     // ── Group 1: Read ──
     {
@@ -1615,7 +1616,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  srv.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -1817,7 +1818,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+  });
+
+  return srv;
+}
+
+const server = buildMcpServer();
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : undefined;
@@ -1854,13 +1860,24 @@ if (PORT) {
     } catch { return null; }
   }
 
+  // OAuth clients registrados dinamicamente pelo Claude.ai (RFC 7591)
+  interface OAuthClient {
+    client_id: string;
+    client_id_issued_at: number;
+    redirect_uris: string[];
+    grant_types: string[];
+    response_types: string[];
+    token_endpoint_auth_method: string;
+    client_name?: string;
+  }
+  const oauthClients = new Map<string, OAuthClient>();
+
   // Códigos OAuth temporários emitidos para o Claude.ai (expiram em 5 min)
-  const pendingCodes = new Map<string, { clientRedirectUri: string; clientState: string | null; email: string; name: string; expiresAt: number }>();
+  const pendingCodes = new Map<string, { clientId: string | null; clientRedirectUri: string; clientState: string | null; codeChallenge: string | null; email: string; name: string; expiresAt: number }>();
   setInterval(() => { const now = Date.now(); for (const [k, v] of pendingCodes) if (v.expiresAt < now) pendingCodes.delete(k); }, 5 * 60 * 1000);
 
-  // Streamable HTTP transport (protocolo moderno, usado pelo Claude.ai web)
-  const mcpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(mcpTransport);
+  // Sessões MCP — um Server + Transport por sessão (stateless reuse é proibido)
+  const mcpSessions = new Map<string, StreamableHTTPServerTransport>();
 
   const PAGE_LANDING = `<!DOCTYPE html>
 <html lang="pt-BR">
@@ -1987,11 +2004,47 @@ function copy(){
         issuer: SERVER_BASE_URL,
         authorization_endpoint: `${SERVER_BASE_URL}/oauth/authorize`,
         token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
+        registration_endpoint: `${SERVER_BASE_URL}/oauth/register`,
         response_types_supported: ["code"],
         grant_types_supported: ["authorization_code"],
         token_endpoint_auth_methods_supported: ["client_secret_post", "none"],
+        code_challenge_methods_supported: ["S256"],
         scopes_supported: ["openid", "profile", "email"],
       }));
+      return;
+    }
+
+    // RFC 9728 — Protected Resource Metadata
+    if (path === "/.well-known/oauth-protected-resource/mcp") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        resource: `${SERVER_BASE_URL}/mcp`,
+        authorization_servers: [SERVER_BASE_URL],
+        scopes_supported: ["openid", "profile", "email"],
+        resource_name: "Make MCP Server",
+      }));
+      return;
+    }
+
+    // Registro dinâmico de clientes OAuth (RFC 7591) — Claude.ai chama antes do fluxo OAuth
+    if (path === "/oauth/register" && req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(body); } catch { /* ignore */ }
+      const clientId = crypto.randomUUID();
+      const client: OAuthClient = {
+        client_id: clientId,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        redirect_uris: (payload.redirect_uris as string[]) ?? [],
+        grant_types: (payload.grant_types as string[]) ?? ["authorization_code"],
+        response_types: (payload.response_types as string[]) ?? ["code"],
+        token_endpoint_auth_method: (payload.token_endpoint_auth_method as string) ?? "none",
+        client_name: payload.client_name as string | undefined,
+      };
+      oauthClients.set(clientId, client);
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(client));
       return;
     }
 
@@ -1999,13 +2052,15 @@ function copy(){
     if (path === "/oauth/authorize") {
       const clientRedirectUri = reqUrl.searchParams.get("redirect_uri");
       const clientState = reqUrl.searchParams.get("state");
+      const clientId = reqUrl.searchParams.get("client_id");
+      const codeChallenge = reqUrl.searchParams.get("code_challenge");
       if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID) {
         res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
         res.end(pageError("Servidor não configurado. Defina AZURE_CLIENT_ID e AZURE_TENANT_ID."));
         return;
       }
-      // Codifica redirect_uri e state do Claude.ai no state que mandamos para a Microsoft
-      const msState = Buffer.from(JSON.stringify({ clientRedirectUri, clientState })).toString("base64url");
+      // Codifica redirect_uri, state, client_id e code_challenge no state para a Microsoft
+      const msState = Buffer.from(JSON.stringify({ clientRedirectUri, clientState, clientId, codeChallenge })).toString("base64url");
       const params = new URLSearchParams({
         client_id: AZURE_CLIENT_ID,
         response_type: "code",
@@ -2102,12 +2157,14 @@ function copy(){
         // Detecta se é fluxo OAuth do Claude.ai (tem state com clientRedirectUri)
         if (msState) {
           try {
-            const stateData = JSON.parse(Buffer.from(msState, "base64url").toString()) as { clientRedirectUri?: string; clientState?: string };
+            const stateData = JSON.parse(Buffer.from(msState, "base64url").toString()) as { clientRedirectUri?: string; clientState?: string; clientId?: string; codeChallenge?: string };
             if (stateData.clientRedirectUri) {
               const authCode = crypto.randomBytes(32).toString("hex");
               pendingCodes.set(authCode, {
+                clientId: stateData.clientId ?? null,
                 clientRedirectUri: stateData.clientRedirectUri,
                 clientState: stateData.clientState ?? null,
+                codeChallenge: stateData.codeChallenge ?? null,
                 email, name,
                 expiresAt: Date.now() + 5 * 60 * 1000,
               });
@@ -2139,14 +2196,26 @@ function copy(){
     if (!verifySession(sessionToken)) {
       res.writeHead(401, {
         "Content-Type": "application/json",
-        "WWW-Authenticate": `Bearer realm="${SERVER_BASE_URL}"`,
+        "WWW-Authenticate": `Bearer realm="${SERVER_BASE_URL}", resource_metadata="${SERVER_BASE_URL}/.well-known/oauth-protected-resource/mcp"`,
       });
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
 
     if (path === "/mcp") {
-      await mcpTransport.handleRequest(req, res);
+      const incomingSession = req.headers["mcp-session-id"] as string | undefined;
+      if (incomingSession && mcpSessions.has(incomingSession)) {
+        await mcpSessions.get(incomingSession)!.handleRequest(req, res);
+      } else {
+        const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => crypto.randomUUID(),
+          onsessioninitialized: (id: string) => { mcpSessions.set(id, transport); },
+          onsessionclosed: (id: string) => { mcpSessions.delete(id); },
+        });
+        const freshServer = buildMcpServer();
+        await freshServer.connect(transport);
+        await transport.handleRequest(req, res);
+      }
     } else {
       res.writeHead(404);
       res.end();
