@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance, AxiosError } from "axios";
 import http from "node:http";
+import crypto from "node:crypto";
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 const MAKE_API_KEY = process.env.MAKE_API_KEY ?? "";
@@ -1825,6 +1826,133 @@ if (PORT) {
   // HTTP/SSE mode — usado no Railway / LibreChat remoto
   let sseTransport: SSEServerTransport | null = null;
 
+  // ── Microsoft OAuth (Entra ID) ────────────────────────────────────────────
+  const AZURE_CLIENT_ID = process.env.AZURE_CLIENT_ID ?? "";
+  const AZURE_CLIENT_SECRET = process.env.AZURE_CLIENT_SECRET ?? "";
+  const AZURE_TENANT_ID = process.env.AZURE_TENANT_ID ?? "";
+  const SESSION_SECRET = process.env.SESSION_SECRET ?? crypto.randomBytes(32).toString("hex");
+  const SERVER_BASE_URL = (process.env.SERVER_BASE_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
+
+  function signSession(email: string, name: string): string {
+    const h = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const p = Buffer.from(JSON.stringify({
+      email, name,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 90 * 86400,
+    })).toString("base64url");
+    const s = crypto.createHmac("sha256", SESSION_SECRET).update(`${h}.${p}`).digest("base64url");
+    return `${h}.${p}.${s}`;
+  }
+
+  function verifySession(token: string): { email: string; name: string } | null {
+    try {
+      const [h, p, s] = token.split(".");
+      if (!h || !p || !s) return null;
+      const expected = crypto.createHmac("sha256", SESSION_SECRET).update(`${h}.${p}`).digest("base64url");
+      if (s !== expected) return null;
+      const payload = JSON.parse(Buffer.from(p, "base64url").toString()) as { email: string; name: string; exp: number };
+      if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+      return { email: payload.email, name: payload.name };
+    } catch { return null; }
+  }
+
+  const PAGE_LANDING = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Make MCP — Vincular conta</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1);padding:48px;max-width:420px;width:100%;text-align:center}
+.icon{font-size:56px;margin-bottom:20px}
+h1{font-size:22px;color:#1a1a1a;margin-bottom:12px}
+p{color:#666;line-height:1.6;margin-bottom:32px}
+.btn{display:inline-flex;align-items:center;gap:10px;background:#0078d4;color:#fff;text-decoration:none;padding:14px 28px;border-radius:6px;font-size:15px;font-weight:500}
+.btn:hover{background:#006ac1}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="icon">&#128279;</div>
+<h1>Make MCP Server</h1>
+<p>Para usar este servidor MCP, vincule sua conta Microsoft da P&#237;er. O acesso &#233; restrito a usu&#225;rios da organiza&#231;&#227;o.</p>
+<a href="/login" class="btn">
+<svg width="20" height="20" viewBox="0 0 21 21" fill="white" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="1" width="9" height="9"/><rect x="11" y="1" width="9" height="9"/><rect x="1" y="11" width="9" height="9"/><rect x="11" y="11" width="9" height="9"/></svg>
+Vincular com Microsoft
+</a>
+</div>
+</body>
+</html>`;
+
+  const pageSuccess = (name: string, token: string) => `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Autentica&#231;&#227;o conclu&#237;da</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1);padding:40px;max-width:580px;width:100%}
+.badge{background:#e8f5e9;color:#2e7d32;border-radius:20px;padding:6px 14px;font-size:13px;font-weight:600;display:inline-block;margin-bottom:20px}
+h1{font-size:22px;color:#1a1a1a;margin-bottom:6px}
+.sub{color:#666;margin-bottom:28px}
+h2{font-size:14px;font-weight:600;color:#444;margin-bottom:10px;margin-top:24px}
+.token-box{background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;padding:14px;font-family:monospace;font-size:12px;word-break:break-all;color:#333;margin-bottom:10px}
+.copy-btn{background:#0078d4;color:#fff;border:none;padding:10px 20px;border-radius:6px;cursor:pointer;font-size:14px;margin-bottom:6px}
+.copy-btn:hover{background:#006ac1}.copy-btn.ok{background:#2e7d32}
+.exp{color:#999;font-size:12px;margin-bottom:24px}
+.info{background:#f8f9fa;border-radius:8px;padding:20px}
+.info p{color:#555;font-size:13px;margin-bottom:10px}
+pre{background:#1e1e1e;color:#d4d4d4;padding:14px;border-radius:6px;font-size:11px;overflow-x:auto;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="badge">&#10003; Autentica&#231;&#227;o conclu&#237;da</div>
+<h1>Bem-vindo, ${name}!</h1>
+<p class="sub">Sua conta Microsoft foi vinculada. Copie o token abaixo e configure no Claude Code.</p>
+<h2>Token de acesso</h2>
+<div class="token-box" id="tok">${token}</div>
+<button class="copy-btn" id="cb" onclick="copy()">Copiar token</button>
+<p class="exp">V&#225;lido por 90 dias. Para renovar, acesse esta p&#225;gina novamente.</p>
+<div class="info">
+<h2>Como configurar no Claude Code</h2>
+<p>Edite a configura&#231;&#227;o do Claude Code e adicione o servidor com o token:</p>
+<pre>{
+  "mcpServers": {
+    "make-mcp": {
+      "url": "${SERVER_BASE_URL}/sse",
+      "headers": {
+        "Authorization": "Bearer ${token}"
+      }
+    }
+  }
+}</pre>
+</div>
+</div>
+<script>
+function copy(){
+  navigator.clipboard.writeText(document.getElementById('tok').textContent).then(function(){
+    var b=document.getElementById('cb');
+    b.textContent='&#10003; Copiado!';b.classList.add('ok');
+    setTimeout(function(){b.textContent='Copiar token';b.classList.remove('ok')},2000);
+  });
+}
+</script>
+</body>
+</html>`;
+
+  const pageError = (msg: string) => `<!DOCTYPE html>
+<html lang="pt-BR">
+<head><meta charset="UTF-8"><title>Erro</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0f2f5;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#fff;border-radius:12px;padding:48px;max-width:420px;width:100%;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.1)}h1{color:#c62828;margin-bottom:16px;font-size:20px}p{color:#666;margin-bottom:24px;line-height:1.6}a{color:#0078d4;text-decoration:none}</style>
+</head>
+<body>
+<div class="card"><h1>Erro de autentica&#231;&#227;o</h1><p>${msg}</p><a href="/">&#8592; Tentar novamente</a></div>
+</body>
+</html>`;
+
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -1836,36 +1964,101 @@ if (PORT) {
       return;
     }
 
-    // Bearer token authentication (skipped for /health)
-    if (req.url !== "/health") {
-      const accessToken = process.env.MCP_ACCESS_TOKEN;
-      if (accessToken) {
-        const authHeader = req.headers["authorization"] ?? "";
-        const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-        if (token !== accessToken) {
-          res.writeHead(401, { "Content-Type": "text/plain" });
-          res.end("Unauthorized");
-          return;
-        }
-      }
+    const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    const path = reqUrl.pathname;
+
+    // ── Rotas públicas ─────────────────────────────────────────────────────────
+    if (path === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("OK");
+      return;
     }
 
-    if (req.method === "GET" && req.url === "/sse") {
+    if (path === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(PAGE_LANDING);
+      return;
+    }
+
+    if (path === "/login") {
+      if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID) {
+        res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(pageError("Servidor não configurado para autenticação Microsoft. Defina AZURE_CLIENT_ID e AZURE_TENANT_ID."));
+        return;
+      }
+      const params = new URLSearchParams({
+        client_id: AZURE_CLIENT_ID,
+        response_type: "code",
+        redirect_uri: `${SERVER_BASE_URL}/auth/callback`,
+        scope: "openid profile email User.Read",
+        response_mode: "query",
+      });
+      res.writeHead(302, { Location: `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/authorize?${params}` });
+      res.end();
+      return;
+    }
+
+    if (path === "/auth/callback") {
+      const code = reqUrl.searchParams.get("code");
+      const oauthError = reqUrl.searchParams.get("error");
+      if (oauthError || !code) {
+        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(pageError(`Autenticação recusada pela Microsoft: ${oauthError ?? "código ausente"}`));
+        return;
+      }
+      try {
+        const tokenParams = new URLSearchParams({
+          client_id: AZURE_CLIENT_ID,
+          client_secret: AZURE_CLIENT_SECRET,
+          code,
+          redirect_uri: `${SERVER_BASE_URL}/auth/callback`,
+          grant_type: "authorization_code",
+          scope: "openid profile email User.Read",
+        });
+        const tokenResp = await axios.post(
+          `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`,
+          tokenParams.toString(),
+          { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+        );
+        const msAccessToken: string = tokenResp.data.access_token;
+        const meResp = await axios.get("https://graph.microsoft.com/v1.0/me", {
+          headers: { Authorization: `Bearer ${msAccessToken}` },
+        });
+        const email: string = meResp.data.mail ?? meResp.data.userPrincipalName ?? "";
+        const name: string = meResp.data.displayName ?? email;
+        const sessionToken = signSession(email, name);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(pageSuccess(name, sessionToken));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Erro desconhecido";
+        res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(pageError(`Falha ao trocar código por token: ${msg}`));
+      }
+      return;
+    }
+
+    // ── Rotas protegidas — exigem token de sessão Microsoft ────────────────────
+    const authHeader = req.headers["authorization"] ?? "";
+    const sessionToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!verifySession(sessionToken)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized", loginUrl: `${SERVER_BASE_URL}/` }));
+      return;
+    }
+
+    if (req.method === "GET" && path === "/sse") {
       if (sseTransport) {
         try { await server.close(); } catch { /* ignore */ }
       }
       sseTransport = new SSEServerTransport("/message", res);
       await server.connect(sseTransport);
-    } else if (req.method === "POST" && req.url?.startsWith("/message")) {
+    } else if (req.method === "POST" && path.startsWith("/message")) {
       if (sseTransport) {
         await sseTransport.handlePostMessage(req, res);
       } else {
         res.writeHead(503, { "Content-Type": "text/plain" });
         res.end("No active SSE session");
       }
-    } else if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("OK");
     } else {
       res.writeHead(404);
       res.end();
